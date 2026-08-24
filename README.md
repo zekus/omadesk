@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="preview.png" alt="Omadesk" width="160">
-</p>
-
 # Omadesk
 
 Omadesk is an [Omarchy](https://omarchy.org/) shell plugin that controls LINAK
