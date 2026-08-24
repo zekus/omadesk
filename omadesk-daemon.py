@@ -50,6 +50,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 
+def fresh_default_config() -> dict[str, Any]:
+    return {**DEFAULT_CONFIG, "presets": dict(DEFAULT_CONFIG["presets"])}
+
+
 def config_dir() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy" / "omadesk"
 
@@ -64,12 +68,12 @@ def state_dir() -> Path:
 def load_config() -> dict[str, Any]:
     path = config_dir() / "config.json"
     if not path.exists():
-        return dict(DEFAULT_CONFIG)
+        return fresh_default_config()
     try:
         data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
-        return dict(DEFAULT_CONFIG)
-    merged = dict(DEFAULT_CONFIG)
+        return fresh_default_config()
+    merged = fresh_default_config()
     merged.update(data if isinstance(data, dict) else {})
     if not isinstance(merged.get("presets"), dict):
         merged["presets"] = dict(DEFAULT_CONFIG["presets"])
