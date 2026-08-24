@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="preview.png" alt="Omadesk" width="160">
+</p>
+
 # Omadesk
 
 Omadesk is an [Omarchy](https://omarchy.org/) shell plugin that controls LINAK
@@ -7,7 +11,7 @@ A desk icon sits in the bar with the current height in centimetres. Omadesk
 never ships a desk address: each computer discovers *your* desk and stores it
 locally.
 
-![Omadesk bar widget and control panel](preview.png)
+![Omadesk bar widget and control panel](assets/screenshot.png)
 
 ## Requirements
 
