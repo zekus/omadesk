@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "id": "omadesk",
+  "name": "Omadesk",
+  "version": "1.0.0",
+  "author": "zekus",
+  "license": "MIT",
+  "description": "Omadesk shows standing desk height in the Omarchy bar, with hold-to-move controls and sit/stand presets for LINAK and IKEA IDÅSEN Bluetooth desks.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Omadesk",
+    "description": "Standing desk height and controls for LINAK Bluetooth desks.",
+    "category": "Hardware",
+    "aliases": [
+      "omadesk",
+      "desk",
+      "standing-desk",
+      "idasen",
+      "linak"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "pollIntervalSec": 2,
+      "showHeightInBar": true
+    },
+    "schema": [
+      {
+        "key": "pollIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 1,
+        "max": 30,
+        "step": 1,
+        "defaultValue": 2,
+        "description": "How often to poll desk height when the panel is closed."
+      },
+      {
+        "key": "showHeightInBar",
+        "type": "boolean",
+        "label": "Show height in bar",
+        "defaultValue": true,
+        "description": "Display the current desk height next to the bar icon."
+      }
+    ]
+  }
+}
