@@ -53,7 +53,7 @@ Item {
   function statusText() {
     if (state === "error") return lastError || "Omadesk unavailable"
     if (state === "starting") return message || "Starting…"
-    if (!connected) return message || "Connecting to desk…"
+    if (!connected) return message || (mac ? "Reconnecting…" : "Connecting to desk…")
     if (moving || Math.abs(speedMps) > 0.0001) return "Moving · " + formatHeight(heightCm)
     return formatHeight(heightCm)
   }
@@ -81,9 +81,11 @@ Item {
       scanning = false
 
     if (payload.event === "error" && payload.error) {
-      state = connected ? "ready" : "starting"
-      lastError = String(payload.error)
-      message = String(payload.error)
+      var text = String(payload.error)
+      var reconnecting = text.toLowerCase().indexOf("reconnect") !== -1
+      state = connected || reconnecting ? (reconnecting ? "starting" : "ready") : "starting"
+      lastError = reconnecting ? "" : text
+      message = reconnecting ? "Reconnecting…" : text
       scanning = false
       return
     }

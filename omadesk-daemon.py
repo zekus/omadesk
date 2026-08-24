@@ -33,10 +33,9 @@ COMMAND_REFERENCE_INPUT_STOP = bytearray([0x01, 0x80])
 
 MIN_HEIGHT_M = 0.62
 MAX_HEIGHT_M = 1.27
-MOVE_TOLERANCE_M = 0.005
 MOVE_LOOP_INTERVAL = 0.1
 MOVE_CONSECUTIVE_ZERO_SPEED = 2
-MOVE_MAX_STALL_RETRIES = 3
+MOVE_MAX_STALL_RETRIES = 10
 DIRECTION_REPEAT_INTERVAL = 0.35
 DIRECTION_SAFETY_SEC = 6.0
 MAX_REQUEST_BYTES = 64 * 1024
@@ -131,6 +130,10 @@ def cm_to_meters(value: float) -> float:
     return value / 100.0
 
 
+def at_displayed_height(height_m: float, target_m: float) -> bool:
+    return meters_to_cm(height_m) == meters_to_cm(target_m)
+
+
 def parse_height(raw: bytes | bytearray) -> tuple[float, float]:
     if len(raw) < 4:
         raise ValueError(f"expected 4 bytes, got {len(raw)}")
@@ -145,16 +148,42 @@ def meters_to_bytes(meters: float) -> bytearray:
     return bytearray(struct.pack("<H", int_raw))
 
 
-async def release_bluez_connection(mac: str) -> None:
+async def _bluetoothctl(mac: str, action: str, timeout: float = 8.0) -> None:
     if not mac:
         return
     proc = await asyncio.create_subprocess_exec(
-        "bluetoothctl", "disconnect", mac,
+        "bluetoothctl", action, mac,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
-    await proc.wait()
-    await asyncio.sleep(0.5)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+
+
+async def release_bluez_connection(mac: str) -> None:
+    await _bluetoothctl(mac, "disconnect", timeout=4.0)
+    await asyncio.sleep(0.25)
+
+
+async def request_bluez_connect(mac: str) -> None:
+    await _bluetoothctl(mac, "connect", timeout=8.0)
+
+
+def is_busy_bluez_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(
+        needle in text
+        for needle in (
+            "already connected",
+            "in progress",
+            "operation already in progress",
+            "br-connection-canceled",
+            "le-connection-abort-by-local",
+        )
+    )
 
 
 def _adv_name(device, adv) -> str:
@@ -211,13 +240,13 @@ def pick_scanned_device(hits: list[tuple[Any, Any]], config: dict[str, Any]):
     return None
 
 
-async def find_desk_device(config: dict[str, Any]):
+async def find_desk_device(config: dict[str, Any], timeout: float = 6.0):
     preferred_mac = str(config.get("mac", "")).strip()
-    hits = await scan_desk_advertisements(15.0)
+    hits = await scan_desk_advertisements(timeout)
     device = pick_scanned_device(hits, config)
     if device is None and preferred_mac:
         await release_bluez_connection(preferred_mac)
-        hits = await scan_desk_advertisements(10.0)
+        hits = await scan_desk_advertisements(min(timeout, 4.0))
         device = pick_scanned_device(hits, config)
     if device is None:
         if not hits:
@@ -226,10 +255,11 @@ async def find_desk_device(config: dict[str, Any]):
             f"Found {len(hits)} desks. Select one in the panel."
         )
 
-    config["mac"] = device.address
-    if device.name:
-        config["name"] = device.name
-    save_config(config)
+    if config.get("mac") != device.address or (device.name and config.get("name") != device.name):
+        config["mac"] = device.address
+        if device.name:
+            config["name"] = device.name
+        save_config(config)
     return device
 
 
@@ -247,9 +277,56 @@ class DeskController:
         self._connect_task: asyncio.Task | None = None
         self._direction: str | None = None
         self.motion_gen: int = 0
+        self._lost = asyncio.Event()
+        self.on_lost = None
+        self._last_wakeup = 0.0
+
+    def _mark_lost(self) -> None:
+        self.connected = False
+        try:
+            self._lost.set()
+        except Exception:
+            pass
+        callback = self.on_lost
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def _on_disconnected(self, _client) -> None:
+        self._mark_lost()
+
+    async def _close_client(self) -> None:
+        client = self.client
+        self.client = None
+        self.connected = False
+        if client is None:
+            return
+        try:
+            if client.is_connected:
+                await asyncio.wait_for(client.disconnect(), timeout=2)
+        except Exception:
+            pass
+
+    async def _handshake(self, target: Any) -> None:
+        await self._close_client()
+        client = BleakClient(
+            target,
+            timeout=8.0,
+            disconnected_callback=self._on_disconnected,
+        )
+        await asyncio.wait_for(client.connect(), timeout=10)
+        self.client = client
+        self.mac = getattr(target, "address", None) or self.mac
+        await self.wakeup()
+        self.height_m, self.speed_m = await self.read_height()
+        self.connected = True
+        self._lost.clear()
+        self._last_wakeup = time.monotonic()
 
     async def connect(self) -> None:
-        if self.client and self.client.is_connected:
+        if self.client and self.client.is_connected and not self._lost.is_set():
             self.connected = True
             return
         if self._connect_task and not self._connect_task.done():
@@ -258,29 +335,31 @@ class DeskController:
 
         async def do_connect() -> None:
             last_error: Exception | None = None
-            for attempt in range(5):
+            mac = str(self.config.get("mac") or self.mac or "").strip()
+            for attempt in range(6):
                 try:
-                    if self.client and self.client.is_connected:
-                        break
-                    device = await find_desk_device(self.config)
+                    if self.client and self.client.is_connected and not self._lost.is_set():
+                        self.connected = True
+                        return
+                    if mac and attempt < 4:
+                        if attempt == 1:
+                            await request_bluez_connect(mac)
+                        elif attempt == 2:
+                            await release_bluez_connection(mac)
+                            await request_bluez_connect(mac)
+                        await self._handshake(mac)
+                        return
+                    device = await find_desk_device(self.config, timeout=4.0 if mac else 8.0)
                     self.mac = device.address
-                    if attempt == 0 and self.mac:
-                        await release_bluez_connection(self.mac)
-                    self.client = BleakClient(device, timeout=20)
-                    await self.client.connect()
-                    await self.wakeup()
-                    self.height_m, self.speed_m = await self.read_height()
-                    self.connected = True
+                    mac = device.address
+                    await self._handshake(device)
                     return
                 except Exception as exc:  # noqa: BLE001
                     last_error = exc
-                    if self.client and self.client.is_connected:
-                        try:
-                            await self.client.disconnect()
-                        except Exception:
-                            pass
-                    self.client = None
-                    await asyncio.sleep(0.5 * (attempt + 1))
+                    await self._close_client()
+                    if mac and is_busy_bluez_error(exc):
+                        await release_bluez_connection(mac)
+                    await asyncio.sleep(0.2 * (attempt + 1))
             self.connected = False
             if last_error is not None:
                 raise last_error
@@ -299,9 +378,7 @@ class DeskController:
                 await self._move_task
             except asyncio.CancelledError:
                 pass
-        if self.client and self.client.is_connected:
-            await self.client.disconnect()
-        self.connected = False
+        await self._close_client()
 
     async def wakeup(self) -> None:
         assert self.client is not None
@@ -411,7 +488,8 @@ class DeskController:
             assert self.client is not None
             try:
                 current, _ = await self.read_height()
-                if abs(current - target_m) < MOVE_TOLERANCE_M:
+                self.height_m = current
+                if at_displayed_height(current, target_m):
                     return
                 await self.client.write_gatt_char(UUID_COMMAND, COMMAND_WAKEUP)
                 await self.client.write_gatt_char(UUID_COMMAND, COMMAND_STOP)
@@ -423,14 +501,14 @@ class DeskController:
                     await asyncio.sleep(MOVE_LOOP_INTERVAL)
                     height, speed = await self.read_height()
                     self.height_m, self.speed_m = height, speed
+                    if at_displayed_height(height, target_m):
+                        break
                     if speed == 0:
                         consecutive_zero += 1
                     else:
                         consecutive_zero = 0
                         stall_retries = 0
                     if consecutive_zero >= MOVE_CONSECUTIVE_ZERO_SPEED:
-                        if abs(height - target_m) < MOVE_TOLERANCE_M:
-                            break
                         stall_retries += 1
                         if stall_retries >= MOVE_MAX_STALL_RETRIES:
                             break
@@ -551,13 +629,6 @@ class DeskDaemon:
                 if cmd in motion_cmds and self.desk.motion_gen != seq:
                     return {**base, **self.desk.status()}
                 if cmd == "status":
-                    if self.desk.connected:
-                        try:
-                            self.desk.height_m, self.desk.speed_m = await asyncio.wait_for(
-                                self.desk.read_height(), timeout=3
-                            )
-                        except Exception:
-                            pass
                     return {**base, **self.desk.status()}
 
                 if cmd == "connect":
@@ -660,6 +731,9 @@ class DeskDaemon:
         print(f"omadesk listening on {socket_path}", file=sys.stderr, flush=True)
 
         async def maintain_connection() -> None:
+            backoff = 0.25
+            self.desk.on_lost = lambda: setattr(self, "_notify_started", False)
+
             while not self._stop.is_set():
                 try:
                     has_target = bool(
@@ -685,19 +759,71 @@ class DeskDaemon:
                             self.config["name"] = device.name
                         save_config(self.config)
                         self.desk.mac = device.address
-                    await self.desk.connect()
-                    if self.desk.connected and not self._notify_started:
-                        await self.desk.start_notify(self.on_height)
-                        self._notify_started = True
-                    if self.desk.connected:
-                        await self.broadcast({**self.desk.status(), "event": "height"})
-                        await asyncio.sleep(5)
+
+                    async with self.desk._lock:
+                        gatt_up = bool(self.desk.client and self.desk.client.is_connected)
+                        if not gatt_up or not self.desk.connected or self.desk._lost.is_set():
+                            self._notify_started = False
+                            self.desk.connected = False
+                            await self.broadcast(
+                                {
+                                    "event": "error",
+                                    "error": "Reconnecting…",
+                                    **self.desk.status(),
+                                    "connected": False,
+                                }
+                            )
+                            if gatt_up:
+                                await self.desk.disconnect()
+                            else:
+                                await self.desk._close_client()
+                            await self.desk.connect()
+                            backoff = 0.25
+
+                        if not self.desk.connected:
+                            raise RuntimeError("desk is not connected")
+
+                        if not self._notify_started:
+                            try:
+                                await self.desk.start_notify(self.on_height)
+                            except Exception as exc:  # noqa: BLE001
+                                if "already" not in str(exc).lower():
+                                    raise
+                            self._notify_started = True
+                    await self.broadcast({**self.desk.status(), "event": "height"})
+                    self.desk._lost.clear()
+                    try:
+                        await asyncio.wait_for(self.desk._lost.wait(), timeout=5.0)
                         continue
+                    except asyncio.TimeoutError:
+                        pass
+                    height_ok = False
+                    for _ in range(2):
+                        try:
+                            async with self.desk._lock:
+                                self.desk.height_m, self.desk.speed_m = await asyncio.wait_for(
+                                    self.desk.read_height(), timeout=3.0
+                                )
+                            height_ok = True
+                            break
+                        except Exception:
+                            await asyncio.sleep(0.3)
+                    if not height_ok:
+                        print("omadesk keepalive failed, reconnecting", file=sys.stderr, flush=True)
+                        self._notify_started = False
+                        async with self.desk._lock:
+                            await self.desk.disconnect()
+                        continue
+                    continue
                 except Exception as exc:  # noqa: BLE001
                     print(f"omadesk BLE connect failed: {exc}", file=sys.stderr, flush=True)
                     self._notify_started = False
                     await self.broadcast({"event": "error", "error": str(exc), **self.desk.status()})
-                await asyncio.sleep(3)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 4.0)
+                    continue
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 4.0)
 
         connect_task = asyncio.create_task(maintain_connection())
 

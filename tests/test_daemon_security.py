@@ -68,6 +68,11 @@ class DaemonSecurityTests(unittest.TestCase):
             {"ok": False, "error": "request too large"},
         )
 
+    def test_preset_move_runs_when_displayed_height_differs_by_two_millimetres(self) -> None:
+        self.assertFalse(DAEMON.at_displayed_height(0.742, 0.74))
+        self.assertTrue(DAEMON.at_displayed_height(0.740, 0.74))
+        self.assertTrue(DAEMON.at_displayed_height(0.7404, 0.74))
+
 
 if __name__ == "__main__":
     unittest.main()
