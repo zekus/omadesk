@@ -211,7 +211,9 @@ Item {
     id: pidCheckProc
     command: ["bash", "-c",
       "pidfile='" + root.pidPath + "'; sock='" + root.socketPath + "'; " +
-      "if [ -f \"$pidfile\" ] && kill -0 \"$(cat \"$pidfile\")\" 2>/dev/null && [ -S \"$sock\" ]; then exit 0; else exit 1; fi"]
+      "pid=$(cat \"$pidfile\" 2>/dev/null) || exit 1; " +
+      "[ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null && [ -S \"$sock\" ] " +
+      "&& tr '\\0' ' ' < \"/proc/$pid/cmdline\" | grep -Fq 'omadesk-daemon.py'"]
     onExited: function(exitCode) {
       if (exitCode === 0) {
         root.openSocket()

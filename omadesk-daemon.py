@@ -5,14 +5,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import json
 import os
 import signal
 import struct
 import sys
+import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from bleak import BleakClient
 
@@ -37,6 +39,9 @@ MOVE_CONSECUTIVE_ZERO_SPEED = 2
 MOVE_MAX_STALL_RETRIES = 3
 DIRECTION_REPEAT_INTERVAL = 0.35
 DIRECTION_SAFETY_SEC = 6.0
+MAX_REQUEST_BYTES = 64 * 1024
+
+_daemon_lock_file: TextIO | None = None
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "mac": "",
@@ -53,6 +58,7 @@ def config_dir() -> Path:
 def state_dir() -> Path:
     path = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "omarchy"
     path.mkdir(parents=True, exist_ok=True)
+    path.chmod(0o700)
     return path
 
 
@@ -75,37 +81,46 @@ def pid_path() -> Path:
     return state_dir() / "omadesk.pid"
 
 
-def read_pid() -> int | None:
-    path = pid_path()
-    if not path.exists():
-        return None
-    try:
-        return int(path.read_text().strip())
-    except ValueError:
-        return None
-
-
-def pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
-
-
 def acquire_daemon_lock() -> bool:
-    existing = read_pid()
-    if existing and pid_alive(existing):
+    global _daemon_lock_file
+
+    lock_file = pid_path().open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.seek(0)
+        existing = lock_file.read().strip() or "unknown"
         print(f"omadesk already running (pid {existing})", file=sys.stderr, flush=True)
+        lock_file.close()
         return False
-    pid_path().write_text(str(os.getpid()))
+
+    os.fchmod(lock_file.fileno(), 0o600)
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    os.fsync(lock_file.fileno())
+    _daemon_lock_file = lock_file
     return True
 
 
 def save_config(config: dict[str, Any]) -> None:
-    path = config_dir()
-    path.mkdir(parents=True, exist_ok=True)
-    (path / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+    directory = config_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    directory.chmod(0o700)
+    destination = directory / "config.json"
+    fd, temporary_name = tempfile.mkstemp(prefix=".config.", dir=directory)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(config, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def meters_to_cm(value: float) -> float:
@@ -502,7 +517,8 @@ class DeskDaemon:
                 return {**base, **self.desk.status()}
 
             if cmd == "scan":
-                hits = await scan_desk_advertisements(8.0)
+                async with self.desk._lock:
+                    hits = await scan_desk_advertisements(8.0)
                 return {
                     **base,
                     "event": "scan",
@@ -610,6 +626,9 @@ class DeskDaemon:
                 if not chunk:
                     break
                 buffer += chunk.decode(errors="replace")
+                if len(buffer.encode()) > MAX_REQUEST_BYTES:
+                    await reply({"ok": False, "error": "request too large"})
+                    break
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
                     line = line.strip()
@@ -637,6 +656,7 @@ class DeskDaemon:
             socket_path.unlink()
 
         server = await asyncio.start_unix_server(self.handle_client, path=str(socket_path))
+        socket_path.chmod(0o600)
         print(f"omadesk listening on {socket_path}", file=sys.stderr, flush=True)
 
         async def maintain_connection() -> None:
@@ -647,7 +667,8 @@ class DeskDaemon:
                         or str(self.config.get("name", "")).strip()
                     )
                     if not has_target and not self.desk.connected:
-                        hits = await scan_desk_advertisements(8.0)
+                        async with self.desk._lock:
+                            hits = await scan_desk_advertisements(8.0)
                         await self.broadcast(
                             {
                                 "event": "scan",
@@ -687,8 +708,6 @@ class DeskDaemon:
             await server.wait_closed()
             if socket_path.exists():
                 socket_path.unlink()
-            if pid_path().exists():
-                pid_path().unlink()
             connect_task.cancel()
             try:
                 await connect_task
