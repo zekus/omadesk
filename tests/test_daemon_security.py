@@ -107,6 +107,89 @@ class DaemonSecurityTests(unittest.TestCase):
                 self.assertTrue(DAEMON.is_busy_bluez_error(RuntimeError(message)))
         self.assertFalse(DAEMON.is_busy_bluez_error(RuntimeError("not authorized")))
 
+    def test_paired_bluez_device_uses_cached_dbus_path_without_scanning(self) -> None:
+        class FakeManager:
+            def get_default_adapter(self) -> str:
+                return "/org/bluez/hci0"
+
+            def get_device_address(self, path: str) -> str:
+                self.path = path
+                return "C8:49:77:59:80:7D"
+
+            def is_paired(self, path: str) -> bool:
+                return True
+
+            def get_device_name(self, path: str) -> str:
+                return "Desk 2893"
+
+        manager = FakeManager()
+
+        async def exercise():
+            with mock.patch(
+                "bleak.backends.bluezdbus.manager.get_global_bluez_manager",
+                mock.AsyncMock(return_value=manager),
+            ):
+                return await DAEMON.paired_bluez_device("c8:49:77:59:80:7d")
+
+        device = asyncio.run(exercise())
+        self.assertIsNotNone(device)
+        self.assertEqual(manager.path, "/org/bluez/hci0/dev_C8_49_77_59_80_7D")
+        self.assertEqual(device.address, "C8:49:77:59:80:7D")
+        self.assertEqual(device.name, "Desk 2893")
+        self.assertEqual(
+            device.details["path"], "/org/bluez/hci0/dev_C8_49_77_59_80_7D"
+        )
+
+    def test_failed_handshake_disconnects_bleak_client_even_when_not_connected(self) -> None:
+        clients = []
+
+        class FailingClient:
+            def __init__(self, *args, **kwargs) -> None:
+                self.is_connected = False
+                self.disconnect_calls = 0
+                clients.append(self)
+
+            async def connect(self) -> None:
+                raise RuntimeError("handshake failed")
+
+            async def disconnect(self) -> None:
+                self.disconnect_calls += 1
+
+        async def exercise() -> DAEMON.DeskController:
+            desk = DAEMON.DeskController("AA:BB")
+            with mock.patch.object(DAEMON, "BleakClient", FailingClient):
+                with self.assertRaisesRegex(RuntimeError, "handshake failed"):
+                    await desk._handshake("AA:BB")
+            return desk
+
+        desk = asyncio.run(exercise())
+        self.assertEqual(len(clients), 1)
+        self.assertEqual(clients[0].disconnect_calls, 1)
+        self.assertIsNone(desk.client)
+        self.assertFalse(desk.connected)
+
+    def test_scan_results_include_saved_paired_desk_without_advertisement(self) -> None:
+        cached = DAEMON.BLEDevice(
+            "C8:49:77:59:80:7D",
+            "Desk 2893",
+            {"path": "/org/bluez/hci0/dev_C8_49_77_59_80_7D"},
+        )
+
+        async def exercise():
+            with mock.patch.object(
+                DAEMON, "paired_bluez_device", mock.AsyncMock(return_value=cached)
+            ):
+                return await DAEMON.include_paired_target(
+                    [], {"mac": cached.address, "name": cached.name}
+                )
+
+        hits = asyncio.run(exercise())
+        self.assertEqual(DAEMON.scan_hits_payload(hits), [{
+            "mac": "C8:49:77:59:80:7D",
+            "name": "Desk 2893",
+            "rssi": None,
+        }])
+
     def test_desk_detection_accepts_service_uuid_or_desk_name(self) -> None:
         named = SimpleNamespace(name="Desk 1234", address="AA")
         unnamed = SimpleNamespace(name=None, address="BB")

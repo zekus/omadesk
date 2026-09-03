@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from bleak import BleakClient
+from bleak.backends.device import BLEDevice
 
 UUID_ADV_SVC = "99fa0001-338a-1024-8a49-009c0215f78a"
 UUID_COMMAND = "99fa0002-338a-1024-8a49-009c0215f78a"
@@ -176,6 +177,62 @@ async def request_bluez_connect(mac: str) -> None:
     await _bluetoothctl(mac, "connect", timeout=8.0)
 
 
+async def paired_bluez_device(mac: str, name: str = "") -> BLEDevice | None:
+    """Resolve a paired Linux device without requiring a new advertisement.
+
+    Passing only an address to BleakClient makes Bleak scan for that address
+    before connecting. Paired desks remain in BlueZ even while they are absent
+    from a live scan, so reuse that cached D-Bus object when it is available.
+    """
+    if not mac or not sys.platform.startswith("linux"):
+        return None
+
+    try:
+        from bleak.backends.bluezdbus.manager import get_global_bluez_manager
+
+        manager = await get_global_bluez_manager()
+        adapter_path = manager.get_default_adapter()
+        device_path = f"{adapter_path}/dev_{mac.upper().replace(':', '_')}"
+        address = manager.get_device_address(device_path)
+        if address.upper() != mac.upper() or not manager.is_paired(device_path):
+            return None
+        cached_name = manager.get_device_name(device_path) or name or None
+        return BLEDevice(
+            address,
+            cached_name,
+            {
+                "path": device_path,
+                "props": {"Adapter": adapter_path, "Alias": cached_name or address},
+            },
+        )
+    except Exception:  # BlueZ cache is an optimization; scanning remains the fallback.
+        return None
+
+
+async def include_paired_target(
+    hits: list[tuple[Any, Any]], config: dict[str, Any]
+) -> list[tuple[Any, Any]]:
+    """Keep the saved paired desk visible when it is absent from a live scan."""
+    mac = str(config.get("mac", "") or "").strip()
+    if not mac or any(device.address.upper() == mac.upper() for device, _ in hits):
+        return hits
+
+    device = await paired_bluez_device(mac, str(config.get("name", "") or ""))
+    if device is None:
+        return hits
+
+    merged = [*hits, (device, None)]
+    merged.sort(key=lambda item: (desk_hit(*item)["name"], item[0].address))
+    return merged
+
+
+async def scan_known_desks(
+    config: dict[str, Any], timeout: float = 8.0
+) -> list[tuple[Any, Any]]:
+    hits = await scan_desk_advertisements(timeout)
+    return await include_paired_target(hits, config)
+
+
 def is_busy_bluez_error(exc: BaseException) -> bool:
     text = str(exc).lower()
     return any(
@@ -246,11 +303,11 @@ def pick_scanned_device(hits: list[tuple[Any, Any]], config: dict[str, Any]):
 
 async def find_desk_device(config: dict[str, Any], timeout: float = 6.0):
     preferred_mac = str(config.get("mac", "")).strip()
-    hits = await scan_desk_advertisements(timeout)
+    hits = await scan_known_desks(config, timeout)
     device = pick_scanned_device(hits, config)
     if device is None and preferred_mac:
         await release_bluez_connection(preferred_mac)
-        hits = await scan_desk_advertisements(min(timeout, 4.0))
+        hits = await scan_known_desks(config, min(timeout, 4.0))
         device = pick_scanned_device(hits, config)
     if device is None:
         if not hits:
@@ -308,8 +365,10 @@ class DeskController:
         if client is None:
             return
         try:
-            if client.is_connected:
-                await asyncio.wait_for(client.disconnect(), timeout=2)
+            # Bleak can retain its D-Bus connection after the peripheral drops
+            # and is_connected becomes false. Always call disconnect() so the
+            # backend releases that socket before the next reconnect attempt.
+            await asyncio.wait_for(client.disconnect(), timeout=2)
         except Exception:
             pass
 
@@ -320,14 +379,18 @@ class DeskController:
             timeout=8.0,
             disconnected_callback=self._on_disconnected,
         )
-        await asyncio.wait_for(client.connect(), timeout=10)
         self.client = client
-        self.mac = getattr(target, "address", None) or self.mac
-        await self.wakeup()
-        self.height_m, self.speed_m = await self.read_height()
-        self.connected = True
-        self._lost.clear()
-        self._last_wakeup = time.monotonic()
+        try:
+            await asyncio.wait_for(client.connect(), timeout=10)
+            self.mac = getattr(target, "address", None) or self.mac
+            await self.wakeup()
+            self.height_m, self.speed_m = await self.read_height()
+            self.connected = True
+            self._lost.clear()
+            self._last_wakeup = time.monotonic()
+        except BaseException:
+            await self._close_client()
+            raise
 
     async def connect(self) -> None:
         if self.client and self.client.is_connected and not self._lost.is_set():
@@ -340,6 +403,9 @@ class DeskController:
         async def do_connect() -> None:
             last_error: Exception | None = None
             mac = str(self.config.get("mac") or self.mac or "").strip()
+            paired_device = await paired_bluez_device(
+                mac, str(self.config.get("name", "") or "")
+            )
             for attempt in range(6):
                 try:
                     if self.client and self.client.is_connected and not self._lost.is_set():
@@ -351,7 +417,7 @@ class DeskController:
                         elif attempt == 2:
                             await release_bluez_connection(mac)
                             await request_bluez_connect(mac)
-                        await self._handshake(mac)
+                        await self._handshake(paired_device or mac)
                         return
                     device = await find_desk_device(self.config, timeout=4.0 if mac else 8.0)
                     self.mac = device.address
@@ -600,7 +666,7 @@ class DeskDaemon:
 
             if cmd == "scan":
                 async with self.desk._lock:
-                    hits = await scan_desk_advertisements(8.0)
+                    hits = await scan_known_desks(self.config, 8.0)
                 return {
                     **base,
                     "event": "scan",
@@ -857,7 +923,7 @@ class DeskDaemon:
 def discover_mac() -> str | None:
     async def _scan() -> str | None:
         config = load_config()
-        hits = await scan_desk_advertisements(12.0)
+        hits = await scan_known_desks(config, 12.0)
         device = pick_scanned_device(hits, config)
         if device is None and len(hits) == 1:
             device = hits[0][0]
@@ -905,13 +971,13 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.discover:
-        hits = asyncio.run(scan_desk_advertisements(12.0))
+        config = load_config()
+        hits = asyncio.run(scan_known_desks(config, 12.0))
         devices = scan_hits_payload(hits)
         print(json.dumps({"devices": devices}, indent=2))
         if not devices:
             print("No Desk device found", file=sys.stderr)
             return 1
-        config = load_config()
         device = pick_scanned_device(hits, config)
         if device is None and len(hits) == 1:
             device = hits[0][0]

@@ -193,13 +193,18 @@ Item {
   }
 
   function scheduleSocketConnect() {
-    if (socketLoader.active) return
     socketWaitTimer.restart()
   }
 
   function openSocket() {
     message = "Connecting to Omadesk…"
-    socketLoader.active = false
+    if (socketLoader.active) {
+      // A failed Quickshell Socket keeps a dead QLocalSocket until its Loader
+      // is destroyed. Recreate it on the next timer tick, not this one.
+      socketLoader.active = false
+      socketWaitTimer.restart()
+      return
+    }
     socketLoader.active = true
   }
 
@@ -258,8 +263,12 @@ Item {
     running: false
     triggeredOnStart: true
     onTriggered: {
-      if (socketLoader.active) {
+      if (root.socketLive) {
         stop()
+        return
+      }
+      if (socketLoader.active) {
+        socketLoader.active = false
         return
       }
       socketCheckProc.running = true
@@ -270,10 +279,7 @@ Item {
     id: socketCheckProc
     command: ["test", "-S", root.socketPath]
     onExited: function(exitCode) {
-      if (exitCode === 0) {
-        socketWaitTimer.stop()
-        root.openSocket()
-      }
+      if (exitCode === 0) root.openSocket()
     }
   }
 
@@ -295,8 +301,8 @@ Item {
     id: pollTimer
     interval: root.pollIntervalMs
     repeat: true
-    running: root.state === "ready" && root.socketLive && !root.requestPending
-    onTriggered: root.refresh()
+    running: root.socketLive
+    onTriggered: if (!root.requestPending) root.refresh()
   }
 
   Loader {
@@ -307,28 +313,34 @@ Item {
       Socket {
         id: cmdSocket
         path: root.socketPath
-        connected: true
+        connected: false
 
         onConnectionStateChanged: {
-          if (!connected) return
+          if (!connected) {
+            root.scheduleSocketConnect()
+            return
+          }
+          socketWaitTimer.stop()
           root.message = "Connecting to desk…"
           root.refresh()
           root.reloadPresets()
-          pollTimer.start()
         }
 
         onError: function(errorCode) {
+          connected = false
           root.connected = false
           root.state = "starting"
           root.message = "Waiting for Omadesk…"
-          socketLoader.active = false
-          root.ensureDaemon()
+          root.scheduleSocketConnect()
+          Qt.callLater(root.ensureDaemon)
         }
 
         parser: SplitParser {
           splitMarker: "\n"
           onRead: function(line) { root.handleLine(line) }
         }
+
+        Component.onCompleted: connected = true
       }
     }
   }
